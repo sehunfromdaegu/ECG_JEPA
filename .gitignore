@@ -11,3 +11,8 @@ cpc/xresnet1d.py
 cpc/__pycache__/basic_conv1d.cpython-39.pyc
 cpc/__pycache__/cpc.cpython-39.pyc
 st_mem.py
+
+
+# Python compiled files
+*.pyc
+__pycache__/

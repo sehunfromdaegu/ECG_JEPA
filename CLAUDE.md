@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-ECG-JEPA is a self-supervised learning framework for 12-lead ECG signal analysis using a Joint-Embedding Predictive Architecture (JEPA). The model learns representations by predicting masked ECG patches in a learned representation space.
+ECG-JEPA is a self-supervised learning framework for 12-lead ECG signal analysis using a Joint-Embedding Predictive Architecture (JEPA). The model learns representations by predicting masked ECG patches in a learned representation space. This implementation now includes Rotary Position Embedding (RoPE) support following DINOv3 architecture patterns.
 
 ## Common Development Commands
 
@@ -43,7 +43,16 @@ python finetuning.py --ckpt_dir ../weights/multiblock_epoch100.pth --dataset ptb
 ### Testing
 ```bash
 # Run performance metrics evaluation
-python perf_metrics.py
+python util/perf_metrics.py
+
+# Test RoPE implementation
+python test_rope.py
+
+# Test attention performance comparison (RoPE vs sincos)
+python test_attention_performance.py
+
+# Simple RoPE functionality test
+python test_rope_simple.py
 ```
 
 ## Architecture Overview
@@ -59,7 +68,9 @@ The JEPA model consists of three main components:
 - **Input Processing**: 12-lead ECG → 8-lead (I, II, V1-V6) → reshape to 8×50 patches
 - **Masking**: Supports random (60-70%) and multi-block (17.5-22.5%) masking strategies
 - **Cross-Attention**: Custom attention pattern allowing within-lead temporal and across-lead spatial attention
+- **Position Encoding**: Default RoPE (Rotary Position Embedding) with 2D spatial-temporal encoding, fallback to sincos
 - **EMA Updates**: Target encoder updated with momentum scheduling (0.996 → 1.0)
+- **RoPE Implementation**: Following DINOv3 pattern - generated once per forward pass, applied in every transformer block
 
 ### Data Flow
 ```
@@ -80,6 +91,7 @@ downstream_tasks/*.py → Linear eval or fine-tuning
 - **`augmentation.py`**: ECG-specific augmentation strategies (filtering, masking, noise)
 - **`models.py`**: Model loading utilities and encoder extraction
 - **`pos_encoding.py`**: 2D sinusoidal positional encoding for spatial-temporal representation
+- **`rope_pos_encoding.py`**: Rotary Position Embedding (RoPE) implementation with 2D and 1D variants
 - **`downstream_tasks/linear_eval.py`**: Linear probing evaluation
 - **`downstream_tasks/finetuning.py`**: Full model fine-tuning
 - **`ptbxl_utils.py`**: PTB-XL specific utilities and evaluation metrics
@@ -108,3 +120,33 @@ downstream_tasks/*.py → Linear eval or fine-tuning
 Download pretrained models and place in `./weights/`:
 - Random masking: `random_epoch100.pth`
 - Multi-block masking: `multiblock_epoch100.pth`
+
+## RoPE Implementation Details
+
+### Position Encoding Options
+The model supports two position encoding types:
+```python
+# Default: RoPE (Rotary Position Embedding)
+model = ecg_jepa(pos_type='rope')  # Default since rope-implementation branch
+
+# Legacy: Sinusoidal position encoding
+model = ecg_jepa(pos_type='sincos')
+```
+
+### RoPE Architecture
+- **2D RoPE for Main Encoder**: Treats 8×50 patches as 2D grid (H=8 leads, W=50 time patches)
+- **1D RoPE for Target Encoder**: Uses 1D RoPE for 50 time patches per lead
+- **Coordinate Shift**: Only time dimension (x-axis) augmented with random shifts (±0.1) during training
+- **DINOv3 Pattern**: RoPE generated once per forward pass, applied in every transformer block
+
+### Testing RoPE
+```bash
+# Basic functionality test
+python test_rope_simple.py
+
+# Comprehensive implementation test
+python test_rope.py
+
+# Performance comparison (RoPE vs sincos)
+python test_attention_performance.py
+```

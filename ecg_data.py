@@ -146,21 +146,21 @@ def waves_cinc(data_dir, reduced_lead=True):
     waves = remove_invalid_samples(waves)
     return waves
 
-def waves_shao(data_dir, reduced_lead=True):
-    waves = []
-    for subdir in subdirectory(data_dir):
-        for minibatch in subdirectory(os.path.join(data_dir, subdir)):
-            ecg_data = get_ecg_data(os.path.join(data_dir, subdir, minibatch), reduced_lead=reduced_lead)
-            waves.append(ecg_data)
-
-    waves = np.concatenate(waves, axis=0)
-    waves = remove_invalid_samples(waves)
-    return waves
-
 # def waves_shao(data_dir, reduced_lead=True):
-#     waves = get_ecg_data(data_dir, reduced_lead=reduced_lead, dx=False)
+#     waves = []
+#     for subdir in subdirectory(data_dir):
+#         for minibatch in subdirectory(os.path.join(data_dir, subdir)):
+#             ecg_data = get_ecg_data(os.path.join(data_dir, subdir, minibatch), reduced_lead=reduced_lead)
+#             waves.append(ecg_data)
+
+#     waves = np.concatenate(waves, axis=0)
 #     waves = remove_invalid_samples(waves)
 #     return waves
+
+def waves_shao(data_dir, reduced_lead=True):
+    waves = get_ecg_data(data_dir, reduced_lead=reduced_lead, dx=False)
+    waves = remove_invalid_samples(waves)
+    return waves
 
 class Code15Dataset(Dataset):
     def __init__(self, data_dir, transform=None, reduced_lead=True, downsample=True, use_cache=True):

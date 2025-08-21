@@ -605,7 +605,9 @@ class ecg_jepa(nn.Module):
                 p=50,
                 t=50,
                 mask_scale=(0.15, .2),  
-                leads=[0,1,2,3,4,5,6,7]
+                leads=[0,1,2,3,4,5,6,7],
+                use_gram=False,
+                gram_loss_weight=1.0
                 ):
         
         super().__init__()
@@ -637,12 +639,44 @@ class ecg_jepa(nn.Module):
 
         self.predictor = MaskTransformerPredictor(embed_dim=encoder_embed_dim, predictor_embed_dim=predictor_embed_dim, depth=predictor_depth, num_heads=predictor_num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale, drop_rate=drop_rate, attn_drop_rate=attn_drop_rate, drop_path_rate=drop_path_rate, norm_layer=norm_layer, init_std=init_std, c=self.c,p=self.p,t=self.t, pos_type=pos_type)
         self.loss_func = torch.nn.SmoothL1Loss()
+        
+        # Gram anchoring components
+        self.use_gram = use_gram
+        self.gram_loss_weight = gram_loss_weight
+        self.gram_teacher = None
+        self.gram_teacher_initialized = False
+        self.gram_loss = None
+        if self.use_gram:
+            from gram_loss import GramLoss
+            self.gram_loss = GramLoss(
+                apply_norm=True,
+                img_level=True,
+                remove_neg=True,
+                remove_only_teacher_neg=False
+            )
 
     def set_target_encoder(self):
         for p in self.target_encoder.parameters():
             p.requires_grad = False
+    
+    def initialize_gram_teacher(self):
+        """Initialize gram teacher from current target encoder"""
+        if self.use_gram:
+            self.gram_teacher = copy.deepcopy(self.target_encoder)
+            for p in self.gram_teacher.parameters():
+                p.requires_grad = False
+            self.gram_teacher_initialized = True
+            print("Gram teacher initialized from target encoder")
+    
+    def update_gram_teacher(self, momentum=0.0):
+        """Update gram teacher from current target encoder with optional momentum"""
+        if self.use_gram and self.gram_teacher_initialized:
+            with torch.no_grad():
+                for param_gram, param_target in zip(self.gram_teacher.parameters(), self.target_encoder.parameters()):
+                    param_gram.data = momentum * param_gram.data + (1 - momentum) * param_target.data
+            print(f"Gram teacher updated with momentum={momentum}")
      
-    def forward(self, x):
+    def forward(self, x, return_features=False):
 
         bs, c, T = x.shape 
         assert T == self.p * self.t, 'Input tensor has wrong shape'
@@ -652,13 +686,14 @@ class ecg_jepa(nn.Module):
         with torch.no_grad():
             h, mask = self.target_encoder(x) # x: (bs,c, p,t), h: (bs,c*p,embed_dim)
             h = torch.nn.functional.layer_norm(h, (h.size(-1),))  # normalize over feature-dimension   
+            h_full = h.clone()  # Keep full representation for gram loss
             h = h.reshape(bs, self.c, self.p, -1) # (bs,c,p,embed_dim)
             masked_h = h[:,:,mask,:]
             masked_h = masked_h.reshape(bs, -1, h.size(-1))
 
         # context process
-        x, _ = self.encoder(x, mask) # (bs,c,p,t) -> (bs,c*p,embed_dim)
-        z = self.predictor(x, mask) # (bs,c*p,embed_dim)->(bs,c*p,proj_dim)
+        x_context, _ = self.encoder(x, mask) # (bs,c,p,t) -> (bs,c*p,embed_dim)
+        z = self.predictor(x_context, mask) # (bs,c*p,embed_dim)->(bs,c*p,proj_dim)
            
         # slicing
         num_mask = mask.sum()
@@ -666,6 +701,29 @@ class ecg_jepa(nn.Module):
         z_pred = z_pred.reshape(bs, -1, z.size(-1))
 
         loss = self.loss_func(z_pred, masked_h)
+        
+        # Compute gram loss if enabled and teacher is initialized
+        gram_loss = torch.tensor(0.0).to(loss.device)
+        if self.use_gram and self.gram_teacher_initialized:
+            # Get student features (from context encoder, all patches)
+            with torch.no_grad():
+                student_features, _ = self.encoder(x.reshape(bs, c, self.p, self.t), None)  # No mask for all patches
+                student_features = torch.nn.functional.layer_norm(student_features, (student_features.size(-1),))
+                
+                # Get gram teacher features
+                gram_teacher_features, _ = self.gram_teacher(x.reshape(bs, c, self.p, self.t), None)
+                gram_teacher_features = torch.nn.functional.layer_norm(gram_teacher_features, (gram_teacher_features.size(-1),))
+            
+            # Compute gram loss at image level
+            # Reshape to (B, N, D) where N = c*p
+            student_features = student_features.reshape(bs, self.c * self.p, -1)
+            gram_teacher_features = gram_teacher_features.reshape(bs, self.c * self.p, -1)
+            
+            gram_loss = self.gram_loss(student_features, gram_teacher_features, img_level=True)
+            loss = loss + self.gram_loss_weight * gram_loss
+        
+        if return_features:
+            return loss, gram_loss, h_full
         return loss
 
 
