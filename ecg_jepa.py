@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 from timm.models.layers import DropPath, trunc_normal_
 from pos_encoding import get_2d_sincos_pos_embed
+from rope_pos_encoding import RoPE2D, RoPE1D, apply_rotary_pos_emb
 
 def union_masks(masks_list):
     return torch.stack(masks_list).any(dim=0)
@@ -73,9 +74,10 @@ class Mlp(nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0.):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0., use_rope=False):
         super().__init__()
         self.num_heads = num_heads
+        self.use_rope = use_rope
         head_dim = dim // num_heads
         # NOTE scale factor was wrong in my original version, can set manually to be compat with prev weights
         self.scale = qk_scale or head_dim ** -0.5
@@ -84,28 +86,51 @@ class Attention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, x, attention_mask):
+    def forward(self, x, attention_mask, rope_sin=None, rope_cos=None):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]  # make torchscript happy (cannot use tensor as tuple)
-
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        if attention_mask is not None:
-            attn = attn.masked_fill(attention_mask == 0, float('-inf'))
-            
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
         
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C) 
+        # Apply RoPE if enabled (following DINOv3 pattern)
+        if self.use_rope and rope_sin is not None and rope_cos is not None:
+            # q and k are already in shape [B, num_heads, N, head_dim]
+            q = apply_rotary_pos_emb(q, rope_sin, rope_cos)
+            k = apply_rotary_pos_emb(k, rope_sin, rope_cos)
+
+        # Use PyTorch's optimized scaled dot product attention (following DINOv3)
+        # This automatically handles scaling and is more efficient
+        if attention_mask is not None:
+            # Convert attention mask to the format expected by scaled_dot_product_attention
+            # Our mask: 1 for allowed, 0 for masked -> Need to convert to additive mask
+            # attention_mask is [N, N], need to expand to [B, num_heads, N, N]
+            attn_bias = attention_mask.unsqueeze(0).unsqueeze(0).expand(B, self.num_heads, -1, -1)
+            # Convert: 1 (allowed) -> 0, 0 (masked) -> -inf
+            attn_bias = torch.where(attn_bias == 1, torch.zeros_like(attn_bias), torch.full_like(attn_bias, float('-inf')))
+            
+            x = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, 
+                attn_mask=attn_bias,
+                dropout_p=self.attn_drop.p if self.training else 0.0
+                # Note: scale is automatically applied in scaled_dot_product_attention
+            )
+        else:
+            x = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v,
+                dropout_p=self.attn_drop.p if self.training else 0.0
+                # Note: scale is automatically applied in scaled_dot_product_attention
+            )
+        
+        x = x.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
 
 class Block(nn.Module):
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
-                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
+                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, use_rope=False):
         super().__init__()
         self.norm1 = norm_layer(dim)
+        self.use_rope = use_rope
         # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
@@ -113,46 +138,60 @@ class Block(nn.Module):
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
         self.attn = Attention(
-            dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
+            dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop, use_rope=use_rope)
 
-    def forward(self, x, attention_mask=None):
-        x = x + self.drop_path(self.attn(self.norm1(x), attention_mask))
+    def forward(self, x, attention_mask=None, rope_sin=None, rope_cos=None):
+        if self.use_rope:
+            x = x + self.drop_path(self.attn(self.norm1(x), attention_mask, rope_sin, rope_cos))
+        else:
+            x = x + self.drop_path(self.attn(self.norm1(x), attention_mask))
         x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x
     
 class Encoder_Block(nn.Module):
     def __init__(self, embed_dim=384, depth=12, num_heads=6, mlp_ratio=4., qkv_bias=False, qk_scale=None,
-                 drop_rate=0., attn_drop_rate=0., drop_path_rate=0., norm_layer=nn.LayerNorm):
+                 drop_rate=0., attn_drop_rate=0., drop_path_rate=0., norm_layer=nn.LayerNorm, use_rope=False):
         super().__init__() 
+        self.use_rope = use_rope
 
         self.blocks = nn.ModuleList([
             Block(
                 dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
                 drop=drop_rate, attn_drop=attn_drop_rate, 
                 drop_path = drop_path_rate[i] if isinstance(drop_path_rate, list) else drop_path_rate,
-                norm_layer=norm_layer)
+                norm_layer=norm_layer, use_rope=use_rope)
             for i in range(depth)])
 
-    def forward(self, x, pos, attention_mask=None):
+    def forward(self, x, pos=None, attention_mask=None, rope_sin=None, rope_cos=None):
         for _, block in enumerate(self.blocks):
-            x = block(x + pos, attention_mask)
+            if self.use_rope:
+                # With RoPE, we don't add positional embeddings
+                x = block(x, attention_mask, rope_sin, rope_cos)
+            else:
+                # Legacy mode with additive positional embeddings
+                x = block(x + pos, attention_mask)
         return x
     
 class Predictor_Block(nn.Module):
     def __init__(self, predictor_embed_dim=192, depth=4, num_heads=6, mlp_ratio=4., qkv_bias=False, qk_scale=None,
-                 drop_rate=0., attn_drop_rate=0., drop_path_rate=0.):
+                 drop_rate=0., attn_drop_rate=0., drop_path_rate=0., use_rope=False):
         super().__init__()    
+        self.use_rope = use_rope
         self.blocks = nn.ModuleList([
             Block(
                 dim=predictor_embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
                 drop=drop_rate, attn_drop=attn_drop_rate, 
-                drop_path = drop_path_rate[i] if isinstance(drop_path_rate, list) else drop_path_rate
+                drop_path = drop_path_rate[i] if isinstance(drop_path_rate, list) else drop_path_rate,
+                use_rope=use_rope
                 )
             for i in range(depth)])
     
-    def forward(self, x, pos, attention_mask=None):
+    def forward(self, x, pos=None, attention_mask=None, rope_sin=None, rope_cos=None):
         for _, block in enumerate(self.blocks):
-            x = block(x + pos, attention_mask)
+            if self.use_rope:
+                x = block(x, attention_mask, rope_sin, rope_cos)
+            else:
+                x = block(x + pos, attention_mask)
         return x
     
 
@@ -186,7 +225,8 @@ class MaskTransformer(nn.Module):
         # self.mask_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
-        self.encoder_blocks = Encoder_Block(embed_dim=embed_dim, depth=depth, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale, drop_rate=drop_rate, attn_drop_rate=attn_drop_rate, drop_path_rate=dpr, norm_layer=norm_layer)
+        self.use_rope = (pos_type == 'rope')
+        self.encoder_blocks = Encoder_Block(embed_dim=embed_dim, depth=depth, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale, drop_rate=drop_rate, attn_drop_rate=attn_drop_rate, drop_path_rate=dpr, norm_layer=norm_layer, use_rope=self.use_rope)
         self.norm = nn.LayerNorm(embed_dim)
         self.c=c
         self.p = p
@@ -194,6 +234,7 @@ class MaskTransformer(nn.Module):
         self.embed_dim = embed_dim
         self.W_P = nn.Linear(t,embed_dim)
         self.leads = leads
+        self.pos_type = pos_type
         
         if pos_type == 'learnable':
             pos_embed = torch.empty((c*p, embed_dim))
@@ -203,6 +244,23 @@ class MaskTransformer(nn.Module):
             self.pos_embed = nn.Parameter(torch.zeros(c*p, embed_dim), requires_grad=False)
             pos_embed = get_2d_sincos_pos_embed(embed_dim,c,p)
             self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float())
+        elif pos_type == 'rope':
+            # Initialize 2D RoPE for full encoder
+            self.rope_2d = RoPE2D(
+                embed_dim=embed_dim,
+                num_heads=num_heads,
+                base=10000.0,
+                shift_x=0.1 if self.training else None,  # Only shift during training
+                normalize_coords='separate'
+            )
+            # Initialize 1D RoPE for single lead processing
+            self.rope_1d = RoPE1D(
+                embed_dim=embed_dim,
+                num_heads=num_heads,
+                base=10000.0,
+                shift_coords=0.1 if self.training else None
+            )
+            self.pos_embed = None  # No additive positional embeddings with RoPE
 
         self.mask_type = mask_type
         # initialize the learnable token
@@ -279,7 +337,16 @@ class MaskTransformer(nn.Module):
 
         x = x.reshape(bs, c*p, t)
 
-        pos_embed = self.pos_embed.unsqueeze(0).expand(x.size(0), -1, -1)
+        # Prepare positional embeddings based on type
+        if self.use_rope:
+            # Generate RoPE embeddings
+            rope_sin, rope_cos = self.rope_2d(self.c, self.p)
+            rope_sin = rope_sin.unsqueeze(0).expand(bs, -1, -1)
+            rope_cos = rope_cos.unsqueeze(0).expand(bs, -1, -1)
+            pos_embed = None
+        else:
+            pos_embed = self.pos_embed.unsqueeze(0).expand(x.size(0), -1, -1)
+            rope_sin, rope_cos = None, None
 
         # Generate or use provided mask   
         if mask is None:
@@ -302,10 +369,17 @@ class MaskTransformer(nn.Module):
         # Slice x and positional embeddings if mask is provided
         if mask is not None:
             x = x[:,vis_idx] # (bs, c, p, embed_dim) -> (bs, c, p', embed_dim)
-            pos_embed = pos_embed[:,vis_idx]  # (bs, c, p, embed_dim) -> (bs, c, p', embed_dim)
+            if self.use_rope:
+                rope_sin = rope_sin[:,vis_idx]
+                rope_cos = rope_cos[:,vis_idx]
+            else:
+                pos_embed = pos_embed[:,vis_idx]  # (bs, c, p, embed_dim) -> (bs, c, p', embed_dim)
             attention_mask = attention_mask[vis_idx][:,vis_idx]
         
-        x = self.encoder_blocks(x, pos_embed, attention_mask)
+        if self.use_rope:
+            x = self.encoder_blocks(x, None, attention_mask, rope_sin, rope_cos)
+        else:
+            x = self.encoder_blocks(x, pos_embed, attention_mask)
 
         # Apply normalization if specified
         if self.norm is not None:
@@ -336,19 +410,41 @@ class MaskTransformer(nn.Module):
         assert x.shape[1] == len(self.leads), f'lead error'
         assert x.shape[2] == 2500, f'Input should be of shape (bs, c, 2500), x.shape[2]={x.shape[2]}'
 
-        pos_embed = self.pos_embed
+        bs,l,_ = x.shape
         attention_mask = self._cross_attention_mask().to(x.device) # (c*p, c*p)
 
-        # restric leads
-        if len(self.leads) < self.c:
-            pos_embed = self.restrict_leads(pos_embed, type='vector')
-            attention_mask = self.restrict_leads(attention_mask, type='matrix')
+        # Prepare positional embeddings based on type
+        if self.use_rope:
+            # For single lead processing, use 1D RoPE for each lead
+            if len(self.leads) < self.c:
+                rope_sin_1d, rope_cos_1d = self.rope_1d(self.p)
+                # Expand for all leads
+                rope_sin = rope_sin_1d.repeat(len(self.leads), 1)  # (n_leads*p, embed_dim)
+                rope_cos = rope_cos_1d.repeat(len(self.leads), 1)
+                rope_sin = rope_sin.unsqueeze(0).expand(bs, -1, -1)
+                rope_cos = rope_cos.unsqueeze(0).expand(bs, -1, -1)
+                attention_mask = self.restrict_leads(attention_mask, type='matrix')
+            else:
+                # Full encoder - use 2D RoPE
+                rope_sin, rope_cos = self.rope_2d(self.c, self.p)
+                rope_sin = rope_sin.unsqueeze(0).expand(bs, -1, -1)
+                rope_cos = rope_cos.unsqueeze(0).expand(bs, -1, -1)
+            pos_embed = None
+        else:
+            pos_embed = self.pos_embed
+            rope_sin, rope_cos = None, None
+            # restric leads
+            if len(self.leads) < self.c:
+                pos_embed = self.restrict_leads(pos_embed, type='vector')
+                attention_mask = self.restrict_leads(attention_mask, type='matrix')
 
-        bs,l,_ = x.shape
         x = x.reshape(bs,-1,50) # (bs,l,2500) -> (bs,l*p,50)
         x = self.W_P(x) # (bs,l*p,50) -> (bs,l*p,embed_dim)
 
-        x = self.encoder_blocks(x, pos_embed, attention_mask)
+        if self.use_rope:
+            x = self.encoder_blocks(x, None, attention_mask, rope_sin, rope_cos)
+        else:
+            x = self.encoder_blocks(x, pos_embed, attention_mask)
 
         if self.norm is not None:
             x = self.norm(x)
@@ -371,10 +467,11 @@ class MaskTransformerPredictor(nn.Module):
                 drop_path_rate=0.0,
                 norm_layer=nn.LayerNorm,
                 init_std=0.02,  
-                pos_type='sincos',
+                pos_type='rope',  # Changed default to 'rope'
                 c=9,
                 p=50,
-                t=50,  
+                t=50,
+                rope_base=10000.0  # RoPE base frequency
                 ):
         
         super().__init__()
@@ -383,6 +480,8 @@ class MaskTransformerPredictor(nn.Module):
         self.c = c
         self.p = p
         self.t = t
+        self.pos_type = pos_type
+        self.use_rope = (pos_type == 'rope')
         self.mask_token = nn.Parameter(torch.zeros(1, 1, predictor_embed_dim))
 
         if pos_type == 'learnable':
@@ -393,12 +492,21 @@ class MaskTransformerPredictor(nn.Module):
             self.pos_embed = nn.Parameter(torch.zeros(p, predictor_embed_dim), requires_grad=False)
             pos_embed = get_2d_sincos_pos_embed(predictor_embed_dim,1,p)
             self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float())
+        elif pos_type == 'rope':
+            # Use 1D RoPE for predictor (processes single patches)
+            self.rope_1d = RoPE1D(
+                embed_dim=predictor_embed_dim,
+                num_heads=num_heads,
+                base=rope_base
+            )
+            self.pos_embed = None
 
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
         self.predictor_blocks = Predictor_Block(predictor_embed_dim=predictor_embed_dim, depth=depth, 
                                                 num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, 
                                                 qk_scale=qk_scale, drop_rate=drop_rate, 
-                                                attn_drop_rate=attn_drop_rate, drop_path_rate=dpr)
+                                                attn_drop_rate=attn_drop_rate, drop_path_rate=dpr,
+                                                use_rope=self.use_rope)
         
         self.predictor_norm = norm_layer(predictor_embed_dim)
         self.predictor_proj = nn.Linear(predictor_embed_dim, embed_dim, bias=True)
@@ -440,17 +548,33 @@ class MaskTransformerPredictor(nn.Module):
         x = torch.cat([x, mask_token], dim=1)
 
         # reorder pos
-        pos = self.pos_embed
+        # Prepare positional embeddings
+        if self.use_rope:
+            rope_sin, rope_cos = self.rope_1d(self.p)
+            # Expand for batch and all leads
+            rope_sin = rope_sin.repeat(self.c, 1)  # (c*p, predictor_embed_dim)
+            rope_cos = rope_cos.repeat(self.c, 1)
+            rope_sin = rope_sin.unsqueeze(0).expand(bs*self.c, -1, -1)  # (bs*c, p, predictor_embed_dim)
+            rope_cos = rope_cos.unsqueeze(0).expand(bs*self.c, -1, -1)
+            pos = None
+        else:
+            pos = self.pos_embed
+            rope_sin, rope_cos = None, None
 
         mask = mask
         vis_idx = (~mask).nonzero(as_tuple=True)[0]
         mask_idx = mask.nonzero(as_tuple=True)[0]
         idx = torch.cat((vis_idx, mask_idx))        
         
-        pos = pos[idx]
-        pos = pos.unsqueeze(0).expand(x.size(0), -1, -1)
-
-        x = self.predictor_blocks(x, pos)
+        if self.use_rope:
+            # For RoPE, we need to reorder the sin/cos embeddings
+            rope_sin = rope_sin[:, idx]
+            rope_cos = rope_cos[:, idx]
+            x = self.predictor_blocks(x, None, None, rope_sin, rope_cos)
+        else:
+            pos = pos[idx]
+            pos = pos.unsqueeze(0).expand(x.size(0), -1, -1)
+            x = self.predictor_blocks(x, pos)
         x = self.predictor_norm(x) 
         x = self.predictor_proj(x)
 
@@ -475,7 +599,7 @@ class ecg_jepa(nn.Module):
                 drop_path_rate=0.0,
                 norm_layer=nn.LayerNorm,
                 init_std=0.02,
-                pos_type='sincos',
+                pos_type='rope',  # Changed default to 'rope'
                 mask_type='block',
                 c=8,
                 p=50,
@@ -546,3 +670,4 @@ class ecg_jepa(nn.Module):
 
 
 
+    

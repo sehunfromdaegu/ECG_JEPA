@@ -17,10 +17,10 @@ def downsample_waves(waves, new_size):
 
 # Argument parser
 parser = argparse.ArgumentParser(description="Pretrain the JEPA model with ECG data")
-parser.add_argument('--mask_scale', type=float, nargs=2, default=[0.175, 0.225], help="Scale of masking")
-parser.add_argument('--batch_size', type=int, default=64, help="Batch size")
-parser.add_argument('--lr', type=float, default=5e-5, help="Learning rate")
-parser.add_argument('--mask_type', type=str, default='block', help="Type of masking") # 'block' or 'random'
+parser.add_argument('--mask_scale', type=float, nargs=2, default=(0.7, 0.8), help="Scale of masking")
+parser.add_argument('--batch_size', type=int, default=128, help="Batch size")
+parser.add_argument('--lr', type=float, default=2.5e-5, help="Learning rate")
+parser.add_argument('--mask_type', type=str, default='random', help="Type of masking") # 'block' or 'random'
 parser.add_argument('--epochs', type=int, default=100, help="Number of epochs")
 parser.add_argument('--wd', type=float, default=0.05, help="Weight decay")
 parser.add_argument('--data_dir_shao', type=str, default='/mount/ecg/physionet.org/files/ecg-arrhythmia/1.0.0/WFDBRecords/', help="Directory for Shaoxing data")
@@ -62,6 +62,7 @@ start_time = time.time()
 # Shaoxing (Ningbo + Chapman)
 waves_shaoxing = waves_shao(data_dir_shao)
 waves_shaoxing = downsample_waves(waves_shaoxing, 2500)
+# waves_shaoxing = np.random.randn(5000, 8, 2500)
 print(f'Shao waves shape: {waves_shaoxing.shape}')
 logging.info(f'Shao waves shape: {waves_shaoxing.shape}')
 
@@ -88,7 +89,7 @@ model = ecg_jepa(encoder_embed_dim=768,
                 drop_path_rate=0.1,
                 mask_scale=mask_scale,
                 mask_type=mask_type,
-                pos_type='sincos',
+                pos_type='rope',
                 c=8,
                 p=50,
                 t=50).to('cuda')
